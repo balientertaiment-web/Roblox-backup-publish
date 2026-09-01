@@ -1,39 +1,445 @@
+name: BBYA Audio Upload - TalonTheDevil
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_file_id:
+        description: Google Drive file ID
+        required: true
+        type: string
+      title:
+        description: Roblox audio title
+        required: true
+        type: string
+      universe_id:
+        description: Roblox Universe ID
+        required: false
+        default: '8116636513'
+        type: string
+
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  upload-audio:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.issue.title, 'BBYA AUDIO UPLOAD')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AUDIO_KEY: ${{ secrets.TALONTHEDEVIL_AUDIO_PUBLISHER }}
+      SPEED_FACTOR: '1.25'
+      PLAYBACK_SPEED: '0.8'
+
+    steps:
+      - name: Connect ACC Roblox source
+        uses: actions/checkout@v4
+        with:
+          repository: ardarawk-cloud/ACC-Roblox-maps
+          ref: main
+          path: acc-roblox-source
+
+      - name: Read upload request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DRIVE_FILE_ID="${{ inputs.drive_file_id }}"
+            AUDIO_TITLE="${{ inputs.title }}"
+            UNIVERSE_ID="${{ inputs.universe_id }}"
+          else
+            BODY="$(jq -r '.issue.body // ""' "$GITHUB_EVENT_PATH")"
+
+            DRIVE_FILE_ID="$(printf '%s\n' "$BODY" | sed -n 's/^drive_file_id=//p' | head -n1)"
+            AUDIO_TITLE="$(printf '%s\n' "$BODY" | sed -n 's/^title=//p' | head -n1)"
+            UNIVERSE_ID="$(printf '%s\n' "$BODY" | sed -n 's/^universe_id=//p' | head -n1)"
+
+            if [ -z "$UNIVERSE_ID" ]; then
+              UNIVERSE_ID="8116636513"
+            fi
+          fi
+
+          [ -n "$DRIVE_FILE_ID" ] || { echo "DRIVE_FILE_ID_MISSING"; exit 10; }
+          [ -n "$AUDIO_TITLE" ] || { echo "AUDIO_TITLE_MISSING"; exit 11; }
+          [ -n "${AUDIO_KEY:-}" ] || { echo "TALONTHEDEVIL_AUDIO_PUBLISHER_MISSING"; exit 12; }
+
+          echo "DRIVE_FILE_ID=$DRIVE_FILE_ID" >> "$GITHUB_ENV"
+          echo "AUDIO_TITLE=$AUDIO_TITLE" >> "$GITHUB_ENV"
+          echo "UNIVERSE_ID=$UNIVERSE_ID" >> "$GITHUB_ENV"
+
+      - name: Install audio tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --quiet gdown
+
       - name: Download original audio
         shell: bash
         run: |
           set -euo pipefail
 
-          OUT="$RUNNER_TEMP/original-audio"
-          rm -f "$OUT"
+          gdown "https://drive.google.com/uc?id=${DRIVE_FILE_ID}" \
+            -O "$RUNNER_TEMP/original-audio"
 
-          if gdown "https://drive.google.com/uc?id=${DRIVE_FILE_ID}" -O "$OUT"; then
-            echo "DOWNLOAD_METHOD=gdown"
-          else
-            echo "gdown failed; trying direct Drive download"
-            rm -f "$OUT"
-
-            curl -fL \
-              --retry 3 \
-              --retry-delay 2 \
-              "https://drive.usercontent.google.com/download?id=${DRIVE_FILE_ID}&export=download&confirm=t" \
-              -o "$OUT" || true
-          fi
-
-          if ! test -s "$OUT" || ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
-            echo "Trying Google Drive fallback"
-            rm -f "$OUT"
-
-            curl -fL \
-              --retry 3 \
-              --retry-delay 2 \
-              "https://drive.google.com/uc?export=download&confirm=t&id=${DRIVE_FILE_ID}" \
-              -o "$OUT"
-          fi
-
-          test -s "$OUT"
+          test -s "$RUNNER_TEMP/original-audio"
 
           ffprobe \
             -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$OUT"
+            "$RUNNER_TEMP/original-audio"
+
+      - name: Prepare 1.25x Roblox upload version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Important:
+          # Rate is raised to 1.25x WITH pitch.
+          # Roblox PlaybackSpeed 0.8 later reverses both speed and pitch.
+          ffmpeg \
+            -y \
+            -hide_banner \
+            -loglevel error \
+            -i "$RUNNER_TEMP/original-audio" \
+            -vn \
+            -af "aresample=44100,asetrate=55125,aresample=44100" \
+            -ac 2 \
+            -ar 44100 \
+            -codec:a libmp3lame \
+            -b:a 192k \
+            "$RUNNER_TEMP/bbya-upload-125.mp3"
+
+          test -s "$RUNNER_TEMP/bbya-upload-125.mp3"
+
+          DURATION="$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$RUNNER_TEMP/bbya-upload-125.mp3")"
+
+          echo "UPLOAD_DURATION=$DURATION"
+
+          python3 - "$DURATION" <<'PY'
+          import sys
+          d=float(sys.argv[1])
+          print(f"Prepared duration: {d:.2f}s")
+          if d > 420:
+              raise SystemExit("ROBLOX_AUDIO_STILL_OVER_420_SECONDS")
+          PY
+
+      - name: Upload audio to Roblox
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import time
+          import urllib.error
+          import urllib.request
+
+          key = os.environ["AUDIO_KEY"]
+          title = os.environ["AUDIO_TITLE"]
+          universe = os.environ["UNIVERSE_ID"]
+          audio = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bbya-upload-125.mp3"
+          result_path = pathlib.Path("upload-result.json")
+
+          def request(url, method="GET", payload=None, headers=None):
+              data = None
+              h = dict(headers or {})
+
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  h.setdefault("Content-Type", "application/json")
+
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=h,
+                  method=method
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      raw = r.read().decode("utf-8", "replace")
+                      return r.status, json.loads(raw) if raw.strip() else {}
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode("utf-8", "replace")
+                  try:
+                      body = json.loads(raw) if raw.strip() else {}
+                  except Exception:
+                      body = {"raw": raw[-3000:]}
+                  return e.code, body
+
+          # Verify TalonTheDevil API key.
+          code, info = request(
+              "https://apis.roblox.com/api-keys/v1/introspect",
+              "POST",
+              {"apiKey": key}
+          )
+
+          if code != 200:
+              raise SystemExit(f"ROBLOX_KEY_INTROSPECT_FAILED HTTP={code}")
+
+          owner = str(info.get("authorizedUserId") or "")
+          scopes = info.get("scopes") or []
+
+          asset_rw = any(
+              s.get("name") == "asset"
+              and {"read", "write"}.issubset(set(s.get("operations") or []))
+              for s in scopes
+          )
+
+          permission_write = any(
+              s.get("name") == "asset-permissions:write"
+              or (
+                  s.get("name") == "asset-permissions"
+                  and "write" in (s.get("operations") or [])
+              )
+              for s in scopes
+          )
+
+          if not owner:
+              raise SystemExit("ROBLOX_AUDIO_OWNER_MISSING")
+
+          if not asset_rw:
+              raise SystemExit("ROBLOX_KEY_MISSING_ASSET_READ_WRITE")
+
+          if not permission_write:
+              raise SystemExit("ROBLOX_KEY_MISSING_ASSET_PERMISSION_WRITE")
+
+          if info.get("expired") is True:
+              raise SystemExit("ROBLOX_AUDIO_KEY_EXPIRED")
+
+          if info.get("enabled") is False:
+              raise SystemExit("ROBLOX_AUDIO_KEY_DISABLED")
+
+          create_request = {
+              "assetType": "Audio",
+              "displayName": title[:50],
+              "description": "BBYA Audio - accelerated upload 1.25x",
+              "creationContext": {
+                  "creator": {
+                      "userId": owner
+                  }
+              }
+          }
+
+          p = subprocess.run(
+              [
+                  "curl",
+                  "-sS",
+                  "--location",
+                  "https://apis.roblox.com/assets/v1/assets",
+                  "--header",
+                  f"x-api-key: {key}",
+                  "--form-string",
+                  "request=" + json.dumps(
+                      create_request,
+                      separators=(",", ":")
+                  ),
+                  "--form",
+                  f"fileContent=@{audio};type=audio/mpeg",
+                  "--write-out",
+                  "\n%{http_code}",
+              ],
+              text=True,
+              capture_output=True
+          )
+
+          body, _, http_code = p.stdout.rpartition("\n")
+
+          try:
+              http_code = int(http_code)
+          except Exception:
+              http_code = 0
+
+          try:
+              upload_response = json.loads(body) if body.strip() else {}
+          except Exception:
+              upload_response = {"raw": body[-3000:]}
+
+          if http_code not in (200, 201, 202):
+              raise SystemExit(
+                  f"ROBLOX_AUDIO_UPLOAD_FAILED HTTP={http_code} RESPONSE={upload_response}"
+              )
+
+          operation_path = upload_response.get("path")
+
+          if not operation_path:
+              raise SystemExit(
+                  f"ROBLOX_OPERATION_PATH_MISSING RESPONSE={upload_response}"
+              )
+
+          asset_id = None
+          moderation_state = ""
+
+          end = time.time() + 300
+
+          while time.time() < end:
+              code, operation = request(
+                  "https://apis.roblox.com/assets/v1/" +
+                  operation_path.lstrip("/"),
+                  headers={"x-api-key": key}
+              )
+
+              if operation.get("done"):
+                  response = operation.get("response") or {}
+                  asset_id = response.get("assetId")
+                  moderation_state = str(
+                      (response.get("moderationResult") or {}).get(
+                          "moderationState"
+                      ) or ""
+                  )
+                  break
+
+              time.sleep(3)
+
+          if not asset_id:
+              raise SystemExit("ROBLOX_ASSET_ID_NOT_RETURNED")
+
+          # Wait briefly for moderation.
+          moderation_history = []
+          end = time.time() + 480
+
+          while time.time() < end:
+              code, asset_info = request(
+                  f"https://apis.roblox.com/assets/v1/assets/{asset_id}",
+                  headers={"x-api-key": key}
+              )
+
+              moderation_state = str(
+                  (asset_info.get("moderationResult") or {}).get(
+                      "moderationState"
+                  ) or moderation_state
+              )
+
+              moderation_history.append({
+                  "http": code,
+                  "state": moderation_state
+              })
+
+              state_upper = moderation_state.upper()
+
+              if "APPROVED" in state_upper:
+                  break
+
+              if any(
+                  word in state_upper
+                  for word in ("REJECTED", "DENIED", "FAILED")
+              ):
+                  break
+
+              time.sleep(15)
+
+          permission = {
+              "attempted": False,
+              "ok": False
+          }
+
+          if "APPROVED" in moderation_state.upper():
+              permission["attempted"] = True
+
+              payload = {
+                  "subjectType": "Universe",
+                  "subjectId": str(universe),
+                  "action": "Use",
+                  "requests": [
+                      {
+                          "assetId": int(asset_id)
+                      }
+                  ]
+              }
+
+              code, permission_response = request(
+                  "https://apis.roblox.com/asset-permissions-api/v1/assets/permissions",
+                  "PATCH",
+                  payload,
+                  {
+                      "x-api-key": key,
+                      "Content-Type": "application/json-patch+json"
+                  }
+              )
+
+              success_ids = [
+                  str(x)
+                  for x in (
+                      permission_response.get("successAssetIds") or []
+                  )
+              ]
+
+              permission["http"] = code
+              permission["response"] = permission_response
+              permission["ok"] = (
+                  str(asset_id) in success_ids
+                  or code in (200, 201, 204)
+              )
+
+          result = {
+              "status": "UPLOAD_COMPLETE",
+              "assetId": str(asset_id),
+              "title": title,
+              "uploaderUserId": owner,
+              "uploadedSpeed": 1.25,
+              "requiredPlaybackSpeed": 0.8,
+              "universeId": str(universe),
+              "moderationState": moderation_state,
+              "permission": permission,
+              "moderationChecks": moderation_history[-20:]
+          }
+
+          result_path.write_text(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+          PY
+
+      - name: Show upload result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f upload-result.json ]; then
+            cat upload-result.json
+            echo "### BBYA Audio Upload" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat upload-result.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Reply result to request issue
+        if: always() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ -f upload-result.json ]; then
+            ASSET_ID="$(jq -r '.assetId // "UNKNOWN"' upload-result.json)"
+            STATE="$(jq -r '.moderationState // "UNKNOWN"' upload-result.json)"
+
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "UPLOAD_COMPLETE | Asset ID: ${ASSET_ID} | Moderation: ${STATE} | Roblox PlaybackSpeed: 0.8"
+          else
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "UPLOAD_WORKFLOW_FAILED — cek GitHub Actions log."
+          fi
