@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          sudo apt-get install -y -qq ffmpeg curl
           python3 -m pip install --quiet gdown
 
       - name: Download original audio
@@ -87,25 +87,71 @@ jobs:
         run: |
           set -euo pipefail
 
-          gdown "https://drive.google.com/uc?id=${DRIVE_FILE_ID}" \
-            -O "$RUNNER_TEMP/original-audio"
+          OUT="$RUNNER_TEMP/original-audio"
+          rm -f "$OUT"
 
-          test -s "$RUNNER_TEMP/original-audio"
+          echo "Trying gdown..."
+
+          if gdown "https://drive.google.com/uc?id=${DRIVE_FILE_ID}" -O "$OUT"; then
+            echo "DOWNLOAD_METHOD=gdown"
+          else
+            echo "gdown failed"
+            rm -f "$OUT"
+          fi
+
+          if ! test -s "$OUT" || ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
+            echo "Trying drive.usercontent.google.com..."
+
+            rm -f "$OUT"
+
+            curl \
+              -fL \
+              --retry 3 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              "https://drive.usercontent.google.com/download?id=${DRIVE_FILE_ID}&export=download&confirm=t" \
+              -o "$OUT" || true
+          fi
+
+          if ! test -s "$OUT" || ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
+            echo "Trying drive.google.com fallback..."
+
+            rm -f "$OUT"
+
+            curl \
+              -fL \
+              --retry 3 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              "https://drive.google.com/uc?export=download&confirm=t&id=${DRIVE_FILE_ID}" \
+              -o "$OUT"
+          fi
+
+          if ! test -s "$OUT"; then
+            echo "GOOGLE_DRIVE_DOWNLOAD_FAILED"
+            exit 20
+          fi
+
+          if ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
+            echo "DOWNLOADED_FILE_IS_NOT_VALID_AUDIO"
+            file "$OUT" || true
+            head -c 300 "$OUT" || true
+            exit 21
+          fi
+
+          echo "DOWNLOAD_OK"
 
           ffprobe \
             -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$RUNNER_TEMP/original-audio"
+            "$OUT"
 
       - name: Prepare 1.25x Roblox upload version
         shell: bash
         run: |
           set -euo pipefail
 
-          # Important:
-          # Rate is raised to 1.25x WITH pitch.
-          # Roblox PlaybackSpeed 0.8 later reverses both speed and pitch.
           ffmpeg \
             -y \
             -hide_banner \
@@ -131,8 +177,10 @@ jobs:
 
           python3 - "$DURATION" <<'PY'
           import sys
-          d=float(sys.argv[1])
+
+          d = float(sys.argv[1])
           print(f"Prepared duration: {d:.2f}s")
+
           if d > 420:
               raise SystemExit("ROBLOX_AUDIO_STILL_OVER_420_SECONDS")
           PY
@@ -154,6 +202,7 @@ jobs:
           key = os.environ["AUDIO_KEY"]
           title = os.environ["AUDIO_TITLE"]
           universe = os.environ["UNIVERSE_ID"]
+
           audio = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bbya-upload-125.mp3"
           result_path = pathlib.Path("upload-result.json")
 
@@ -176,15 +225,17 @@ jobs:
                   with urllib.request.urlopen(req, timeout=45) as r:
                       raw = r.read().decode("utf-8", "replace")
                       return r.status, json.loads(raw) if raw.strip() else {}
+
               except urllib.error.HTTPError as e:
                   raw = e.read().decode("utf-8", "replace")
+
                   try:
                       body = json.loads(raw) if raw.strip() else {}
                   except Exception:
                       body = {"raw": raw[-3000:]}
+
                   return e.code, body
 
-          # Verify TalonTheDevil API key.
           code, info = request(
               "https://apis.roblox.com/api-keys/v1/introspect",
               "POST",
@@ -192,14 +243,18 @@ jobs:
           )
 
           if code != 200:
-              raise SystemExit(f"ROBLOX_KEY_INTROSPECT_FAILED HTTP={code}")
+              raise SystemExit(
+                  f"ROBLOX_KEY_INTROSPECT_FAILED HTTP={code}"
+              )
 
           owner = str(info.get("authorizedUserId") or "")
           scopes = info.get("scopes") or []
 
           asset_rw = any(
               s.get("name") == "asset"
-              and {"read", "write"}.issubset(set(s.get("operations") or []))
+              and {"read", "write"}.issubset(
+                  set(s.get("operations") or [])
+              )
               for s in scopes
           )
 
@@ -216,10 +271,14 @@ jobs:
               raise SystemExit("ROBLOX_AUDIO_OWNER_MISSING")
 
           if not asset_rw:
-              raise SystemExit("ROBLOX_KEY_MISSING_ASSET_READ_WRITE")
+              raise SystemExit(
+                  "ROBLOX_KEY_MISSING_ASSET_READ_WRITE"
+              )
 
           if not permission_write:
-              raise SystemExit("ROBLOX_KEY_MISSING_ASSET_PERMISSION_WRITE")
+              raise SystemExit(
+                  "ROBLOX_KEY_MISSING_ASSET_PERMISSION_WRITE"
+              )
 
           if info.get("expired") is True:
               raise SystemExit("ROBLOX_AUDIO_KEY_EXPIRED")
@@ -230,7 +289,7 @@ jobs:
           create_request = {
               "assetType": "Audio",
               "displayName": title[:50],
-              "description": "BBYA Audio - accelerated upload 1.25x",
+              "description": "BBYA Audio upload",
               "creationContext": {
                   "creator": {
                       "userId": owner
@@ -268,20 +327,29 @@ jobs:
               http_code = 0
 
           try:
-              upload_response = json.loads(body) if body.strip() else {}
+              upload_response = (
+                  json.loads(body)
+                  if body.strip()
+                  else {}
+              )
           except Exception:
-              upload_response = {"raw": body[-3000:]}
+              upload_response = {
+                  "raw": body[-3000:]
+              }
 
           if http_code not in (200, 201, 202):
               raise SystemExit(
-                  f"ROBLOX_AUDIO_UPLOAD_FAILED HTTP={http_code} RESPONSE={upload_response}"
+                  f"ROBLOX_AUDIO_UPLOAD_FAILED "
+                  f"HTTP={http_code} "
+                  f"RESPONSE={upload_response}"
               )
 
           operation_path = upload_response.get("path")
 
           if not operation_path:
               raise SystemExit(
-                  f"ROBLOX_OPERATION_PATH_MISSING RESPONSE={upload_response}"
+                  f"ROBLOX_OPERATION_PATH_MISSING "
+                  f"RESPONSE={upload_response}"
               )
 
           asset_id = None
@@ -293,38 +361,50 @@ jobs:
               code, operation = request(
                   "https://apis.roblox.com/assets/v1/" +
                   operation_path.lstrip("/"),
-                  headers={"x-api-key": key}
+                  headers={
+                      "x-api-key": key
+                  }
               )
 
               if operation.get("done"):
                   response = operation.get("response") or {}
+
                   asset_id = response.get("assetId")
+
                   moderation_state = str(
-                      (response.get("moderationResult") or {}).get(
-                          "moderationState"
-                      ) or ""
+                      (
+                          response.get("moderationResult")
+                          or {}
+                      ).get("moderationState")
+                      or ""
                   )
+
                   break
 
               time.sleep(3)
 
           if not asset_id:
-              raise SystemExit("ROBLOX_ASSET_ID_NOT_RETURNED")
+              raise SystemExit(
+                  "ROBLOX_ASSET_ID_NOT_RETURNED"
+              )
 
-          # Wait briefly for moderation.
           moderation_history = []
           end = time.time() + 480
 
           while time.time() < end:
               code, asset_info = request(
                   f"https://apis.roblox.com/assets/v1/assets/{asset_id}",
-                  headers={"x-api-key": key}
+                  headers={
+                      "x-api-key": key
+                  }
               )
 
               moderation_state = str(
-                  (asset_info.get("moderationResult") or {}).get(
-                      "moderationState"
-                  ) or moderation_state
+                  (
+                      asset_info.get("moderationResult")
+                      or {}
+                  ).get("moderationState")
+                  or moderation_state
               )
 
               moderation_history.append({
@@ -339,7 +419,11 @@ jobs:
 
               if any(
                   word in state_upper
-                  for word in ("REJECTED", "DENIED", "FAILED")
+                  for word in (
+                      "REJECTED",
+                      "DENIED",
+                      "FAILED"
+                  )
               ):
                   break
 
@@ -370,19 +454,23 @@ jobs:
                   payload,
                   {
                       "x-api-key": key,
-                      "Content-Type": "application/json-patch+json"
+                      "Content-Type":
+                          "application/json-patch+json"
                   }
               )
 
               success_ids = [
                   str(x)
                   for x in (
-                      permission_response.get("successAssetIds") or []
+                      permission_response.get(
+                          "successAssetIds"
+                      ) or []
                   )
               ]
 
               permission["http"] = code
               permission["response"] = permission_response
+
               permission["ok"] = (
                   str(asset_id) in success_ids
                   or code in (200, 201, 204)
@@ -398,7 +486,8 @@ jobs:
               "universeId": str(universe),
               "moderationState": moderation_state,
               "permission": permission,
-              "moderationChecks": moderation_history[-20:]
+              "moderationChecks":
+                  moderation_history[-20:]
           }
 
           result_path.write_text(
@@ -410,7 +499,13 @@ jobs:
               encoding="utf-8"
           )
 
-          print(json.dumps(result, indent=2, ensure_ascii=False))
+          print(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
           PY
 
       - name: Show upload result
@@ -419,10 +514,18 @@ jobs:
         run: |
           if [ -f upload-result.json ]; then
             cat upload-result.json
-            echo "### BBYA Audio Upload" >> "$GITHUB_STEP_SUMMARY"
-            echo '```json' >> "$GITHUB_STEP_SUMMARY"
-            cat upload-result.json >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            echo "### BBYA Audio Upload" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+            echo '```json' \
+              >> "$GITHUB_STEP_SUMMARY"
+
+            cat upload-result.json \
+              >> "$GITHUB_STEP_SUMMARY"
+
+            echo '```' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Reply result to request issue
@@ -432,14 +535,23 @@ jobs:
         shell: bash
         run: |
           if [ -f upload-result.json ]; then
-            ASSET_ID="$(jq -r '.assetId // "UNKNOWN"' upload-result.json)"
-            STATE="$(jq -r '.moderationState // "UNKNOWN"' upload-result.json)"
+            ASSET_ID="$(
+              jq -r '.assetId // "UNKNOWN"' \
+                upload-result.json
+            )"
 
-            gh issue comment "${{ github.event.issue.number }}" \
+            STATE="$(
+              jq -r '.moderationState // "UNKNOWN"' \
+                upload-result.json
+            )"
+
+            gh issue comment \
+              "${{ github.event.issue.number }}" \
               --repo "${{ github.repository }}" \
               --body "UPLOAD_COMPLETE | Asset ID: ${ASSET_ID} | Moderation: ${STATE} | Roblox PlaybackSpeed: 0.8"
           else
-            gh issue comment "${{ github.event.issue.number }}" \
+            gh issue comment \
+              "${{ github.event.issue.number }}" \
               --repo "${{ github.repository }}" \
               --body "UPLOAD_WORKFLOW_FAILED — cek GitHub Actions log."
           fi
