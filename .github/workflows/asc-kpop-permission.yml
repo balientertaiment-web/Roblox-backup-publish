@@ -42,7 +42,7 @@ jobs:
               report['introspectHttp']=code
               report['authorizedUserId']=str(info.get('authorizedUserId')) if isinstance(info,dict) and info.get('authorizedUserId') is not None else None
               report['scopes']=[{'name':s.get('name'),'operations':s.get('operations') or []} for s in (info.get('scopes') or [])] if isinstance(info,dict) else []
-              can_write=any(s.get('name')=='asset-permissions:write' for s in report['scopes'])
+              can_write=any((s.get('name')=='asset-permissions' and 'write' in (s.get('operations') or [])) or s.get('name')=='asset-permissions:write' for s in report['scopes'])
               report['hasAssetPermissionsWrite']=can_write
               if code!=200 or not can_write:
                   report['status']='NO_ASSET_PERMISSION_SCOPE'
