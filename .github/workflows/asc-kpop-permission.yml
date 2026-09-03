@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      AUDIO_KEY: 
+      AUDIO_KEY: ${{ secrets.TALONTHEDEVIL_AUDIO_PUBLISHER }}
       UNIVERSE_ID: '10745359869'
     steps:
       - name: Grant KPOP bank audio use to After School City
@@ -61,7 +61,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: asc-kpop-permission-33746969266
+          name: asc-kpop-permission-result
           path: asc-kpop-permission-result.json
           if-no-files-found: error
           retention-days: 30
