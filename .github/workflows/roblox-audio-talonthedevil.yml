@@ -12,11 +12,25 @@ on:
         required: true
         type: string
       universe_id:
-        description: Roblox Universe ID
+        description: Backward-compatible single target Universe; blank uses AM_STUDIO_SHARED
         required: false
-        default: '8116636513'
+        default: ''
         type: string
-
+      permission_mode:
+        description: AM_STUDIO_SHARED, TARGET_PROJECT, or CUSTOM
+        required: false
+        default: AM_STUDIO_SHARED
+        type: string
+      target_projects:
+        description: Comma-separated registry project keys
+        required: false
+        default: ''
+        type: string
+      universe_ids:
+        description: Explicit registered Universe IDs for CUSTOM
+        required: false
+        default: ''
+        type: string
   issues:
     types: [opened]
 
@@ -26,532 +40,107 @@ permissions:
 
 jobs:
   upload-audio:
-    if: >
+    if: >-
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.event.issue.title, 'BBYA AUDIO UPLOAD')
-
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 330
     env:
       AUDIO_KEY: ${{ secrets.TALONTHEDEVIL_AUDIO_PUBLISHER }}
-      SPEED_FACTOR: '1.25'
-      PLAYBACK_SPEED: '0.8'
+      AUDIO_KEY_SECRET_NAME: TALONTHEDEVIL_AUDIO_PUBLISHER
+      MAX_MODERATION_WAIT_SECONDS: '14400'
 
     steps:
-      - name: Connect ACC Roblox source
+      - name: Checkout uploader
         uses: actions/checkout@v4
-        with:
-          repository: ardarawk-cloud/ACC-Roblox-maps
-          ref: main
-          path: acc-roblox-source
 
-      - name: Read upload request
+      - name: Resolve backward-compatible request
         shell: bash
+        env:
+          DRIVE_FILE_ID_INPUT: ${{ inputs.drive_file_id }}
+          TITLE_INPUT: ${{ inputs.title }}
+          LEGACY_UNIVERSE_INPUT: ${{ inputs.universe_id }}
+          MODE_INPUT: ${{ inputs.permission_mode }}
+          PROJECTS_INPUT: ${{ inputs.target_projects }}
+          UNIVERSES_INPUT: ${{ inputs.universe_ids }}
         run: |
           set -euo pipefail
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            DRIVE_FILE_ID="${{ inputs.drive_file_id }}"
-            AUDIO_TITLE="${{ inputs.title }}"
-            UNIVERSE_ID="${{ inputs.universe_id }}"
-          else
-            BODY="$(jq -r '.issue.body // ""' "$GITHUB_EVENT_PATH")"
-
-            DRIVE_FILE_ID="$(printf '%s\n' "$BODY" | sed -n 's/^drive_file_id=//p' | head -n1)"
-            AUDIO_TITLE="$(printf '%s\n' "$BODY" | sed -n 's/^title=//p' | head -n1)"
-            UNIVERSE_ID="$(printf '%s\n' "$BODY" | sed -n 's/^universe_id=//p' | head -n1)"
-
-            if [ -z "$UNIVERSE_ID" ]; then
-              UNIVERSE_ID="8116636513"
-            fi
-          fi
-
-          [ -n "$DRIVE_FILE_ID" ] || { echo "DRIVE_FILE_ID_MISSING"; exit 10; }
-          [ -n "$AUDIO_TITLE" ] || { echo "AUDIO_TITLE_MISSING"; exit 11; }
-          [ -n "${AUDIO_KEY:-}" ] || { echo "TALONTHEDEVIL_AUDIO_PUBLISHER_MISSING"; exit 12; }
-
-          echo "DRIVE_FILE_ID=$DRIVE_FILE_ID" >> "$GITHUB_ENV"
-          echo "AUDIO_TITLE=$AUDIO_TITLE" >> "$GITHUB_ENV"
-          echo "UNIVERSE_ID=$UNIVERSE_ID" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, pathlib
+          if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch':
+              drive = os.environ.get('DRIVE_FILE_ID_INPUT','').strip()
+              title = os.environ.get('TITLE_INPUT','').strip()
+              legacy = os.environ.get('LEGACY_UNIVERSE_INPUT','').strip()
+              mode = (os.environ.get('MODE_INPUT','') or 'AM_STUDIO_SHARED').strip()
+              projects = os.environ.get('PROJECTS_INPUT','').strip()
+              universes = os.environ.get('UNIVERSES_INPUT','').strip()
+          else:
+              event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+              body = (event.get('issue') or {}).get('body') or ''
+              fields = {}
+              for line in body.splitlines():
+                  if '=' in line:
+                      key, value = line.split('=',1); fields[key.strip()] = value.strip()
+              drive = fields.get('drive_file_id','')
+              title = fields.get('title','')
+              legacy = fields.get('universe_id','')
+              mode = fields.get('permission_mode','AM_STUDIO_SHARED')
+              projects = fields.get('target_projects','')
+              universes = fields.get('universe_ids','')
+          if not drive or not title:
+              raise SystemExit('DRIVE_FILE_ID_AND_TITLE_REQUIRED')
+          if legacy and not universes and mode.upper() == 'AM_STUDIO_SHARED':
+              mode = 'CUSTOM'; universes = legacy
+          batch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'talon-audio-batch.json'
+          batch.write_text(json.dumps([{'drive_file_id': drive, 'title': title}], ensure_ascii=False), encoding='utf-8')
+          with pathlib.Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8') as f:
+              f.write(f'PERMISSION_MODE={mode}\nTARGET_PROJECTS={projects}\nCUSTOM_UNIVERSE_IDS={universes}\n')
+          print(f'Talon route standardized: speed=1.75 playback=0.5714285714 mode={mode}')
+          PY
 
       - name: Install audio tools
         shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg curl
-          python3 -m pip install --quiet gdown
+          python3 -m pip install --quiet 'gdown==6.1.0'
 
-      - name: Download original audio
+      - name: Unified 1.75x upload and permission contract
         shell: bash
         run: |
           set -euo pipefail
-
-          OUT="$RUNNER_TEMP/original-audio"
-          rm -f "$OUT"
-
-          echo "Trying gdown..."
-
-          if gdown "https://drive.google.com/uc?id=${DRIVE_FILE_ID}" -O "$OUT"; then
-            echo "DOWNLOAD_METHOD=gdown"
-          else
-            echo "gdown failed"
-            rm -f "$OUT"
-          fi
-
-          if ! test -s "$OUT" || ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
-            echo "Trying drive.usercontent.google.com..."
-
-            rm -f "$OUT"
-
-            curl \
-              -fL \
-              --retry 3 \
-              --retry-delay 2 \
-              --connect-timeout 30 \
-              "https://drive.usercontent.google.com/download?id=${DRIVE_FILE_ID}&export=download&confirm=t" \
-              -o "$OUT" || true
-          fi
-
-          if ! test -s "$OUT" || ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
-            echo "Trying drive.google.com fallback..."
-
-            rm -f "$OUT"
-
-            curl \
-              -fL \
-              --retry 3 \
-              --retry-delay 2 \
-              --connect-timeout 30 \
-              "https://drive.google.com/uc?export=download&confirm=t&id=${DRIVE_FILE_ID}" \
-              -o "$OUT"
-          fi
-
-          if ! test -s "$OUT"; then
-            echo "GOOGLE_DRIVE_DOWNLOAD_FAILED"
-            exit 20
-          fi
-
-          if ! ffprobe -v error "$OUT" >/dev/null 2>&1; then
-            echo "DOWNLOADED_FILE_IS_NOT_VALID_AUDIO"
-            file "$OUT" || true
-            head -c 300 "$OUT" || true
-            exit 21
-          fi
-
-          echo "DOWNLOAD_OK"
-
-          ffprobe \
-            -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            "$OUT"
-
-      - name: Prepare 1.25x Roblox upload version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ffmpeg \
-            -y \
-            -hide_banner \
-            -loglevel error \
-            -i "$RUNNER_TEMP/original-audio" \
-            -vn \
-            -af "aresample=44100,asetrate=55125,aresample=44100" \
-            -ac 2 \
-            -ar 44100 \
-            -codec:a libmp3lame \
-            -b:a 192k \
-            "$RUNNER_TEMP/bbya-upload-125.mp3"
-
-          test -s "$RUNNER_TEMP/bbya-upload-125.mp3"
-
-          DURATION="$(ffprobe \
-            -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            "$RUNNER_TEMP/bbya-upload-125.mp3")"
-
-          echo "UPLOAD_DURATION=$DURATION"
-
-          python3 - "$DURATION" <<'PY'
-          import sys
-
-          d = float(sys.argv[1])
-          print(f"Prepared duration: {d:.2f}s")
-
-          if d > 420:
-              raise SystemExit("ROBLOX_AUDIO_STILL_OVER_420_SECONDS")
-          PY
-
-      - name: Upload audio to Roblox
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import time
-          import urllib.error
-          import urllib.request
-
-          key = os.environ["AUDIO_KEY"]
-          title = os.environ["AUDIO_TITLE"]
-          universe = os.environ["UNIVERSE_ID"]
-
-          audio = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bbya-upload-125.mp3"
-          result_path = pathlib.Path("upload-result.json")
-
-          def request(url, method="GET", payload=None, headers=None):
-              data = None
-              h = dict(headers or {})
-
-              if payload is not None:
-                  data = json.dumps(payload).encode("utf-8")
-                  h.setdefault("Content-Type", "application/json")
-
-              req = urllib.request.Request(
-                  url,
-                  data=data,
-                  headers=h,
-                  method=method
-              )
-
-              try:
-                  with urllib.request.urlopen(req, timeout=45) as r:
-                      raw = r.read().decode("utf-8", "replace")
-                      return r.status, json.loads(raw) if raw.strip() else {}
-
-              except urllib.error.HTTPError as e:
-                  raw = e.read().decode("utf-8", "replace")
-
-                  try:
-                      body = json.loads(raw) if raw.strip() else {}
-                  except Exception:
-                      body = {"raw": raw[-3000:]}
-
-                  return e.code, body
-
-          code, info = request(
-              "https://apis.roblox.com/api-keys/v1/introspect",
-              "POST",
-              {"apiKey": key}
-          )
-
-          if code != 200:
-              raise SystemExit(
-                  f"ROBLOX_KEY_INTROSPECT_FAILED HTTP={code}"
-              )
-
-          owner = str(info.get("authorizedUserId") or "")
-          scopes = info.get("scopes") or []
-
-          asset_rw = any(
-              s.get("name") == "asset"
-              and {"read", "write"}.issubset(
-                  set(s.get("operations") or [])
-              )
-              for s in scopes
-          )
-
-          permission_write = any(
-              s.get("name") == "asset-permissions:write"
-              or (
-                  s.get("name") == "asset-permissions"
-                  and "write" in (s.get("operations") or [])
-              )
-              for s in scopes
-          )
-
-          if not owner:
-              raise SystemExit("ROBLOX_AUDIO_OWNER_MISSING")
-
-          if not asset_rw:
-              raise SystemExit(
-                  "ROBLOX_KEY_MISSING_ASSET_READ_WRITE"
-              )
-
-          if not permission_write:
-              raise SystemExit(
-                  "ROBLOX_KEY_MISSING_ASSET_PERMISSION_WRITE"
-              )
-
-          if info.get("expired") is True:
-              raise SystemExit("ROBLOX_AUDIO_KEY_EXPIRED")
-
-          if info.get("enabled") is False:
-              raise SystemExit("ROBLOX_AUDIO_KEY_DISABLED")
-
-          create_request = {
-              "assetType": "Audio",
-              "displayName": title[:50],
-              "description": "BBYA Audio upload",
-              "creationContext": {
-                  "creator": {
-                      "userId": owner
-                  }
-              }
-          }
-
-          p = subprocess.run(
-              [
-                  "curl",
-                  "-sS",
-                  "--location",
-                  "https://apis.roblox.com/assets/v1/assets",
-                  "--header",
-                  f"x-api-key: {key}",
-                  "--form-string",
-                  "request=" + json.dumps(
-                      create_request,
-                      separators=(",", ":")
-                  ),
-                  "--form",
-                  f"fileContent=@{audio};type=audio/mpeg",
-                  "--write-out",
-                  "\n%{http_code}",
-              ],
-              text=True,
-              capture_output=True
-          )
-
-          body, _, http_code = p.stdout.rpartition("\n")
-
-          try:
-              http_code = int(http_code)
-          except Exception:
-              http_code = 0
-
-          try:
-              upload_response = (
-                  json.loads(body)
-                  if body.strip()
-                  else {}
-              )
-          except Exception:
-              upload_response = {
-                  "raw": body[-3000:]
-              }
-
-          if http_code not in (200, 201, 202):
-              raise SystemExit(
-                  f"ROBLOX_AUDIO_UPLOAD_FAILED "
-                  f"HTTP={http_code} "
-                  f"RESPONSE={upload_response}"
-              )
-
-          operation_path = upload_response.get("path")
-
-          if not operation_path:
-              raise SystemExit(
-                  f"ROBLOX_OPERATION_PATH_MISSING "
-                  f"RESPONSE={upload_response}"
-              )
-
-          asset_id = None
-          moderation_state = ""
-
-          end = time.time() + 300
-
-          while time.time() < end:
-              code, operation = request(
-                  "https://apis.roblox.com/assets/v1/" +
-                  operation_path.lstrip("/"),
-                  headers={
-                      "x-api-key": key
-                  }
-              )
-
-              if operation.get("done"):
-                  response = operation.get("response") or {}
-
-                  asset_id = response.get("assetId")
-
-                  moderation_state = str(
-                      (
-                          response.get("moderationResult")
-                          or {}
-                      ).get("moderationState")
-                      or ""
-                  )
-
-                  break
-
-              time.sleep(3)
-
-          if not asset_id:
-              raise SystemExit(
-                  "ROBLOX_ASSET_ID_NOT_RETURNED"
-              )
-
-          moderation_history = []
-          end = time.time() + 480
-
-          while time.time() < end:
-              code, asset_info = request(
-                  f"https://apis.roblox.com/assets/v1/assets/{asset_id}",
-                  headers={
-                      "x-api-key": key
-                  }
-              )
-
-              moderation_state = str(
-                  (
-                      asset_info.get("moderationResult")
-                      or {}
-                  ).get("moderationState")
-                  or moderation_state
-              )
-
-              moderation_history.append({
-                  "http": code,
-                  "state": moderation_state
-              })
-
-              state_upper = moderation_state.upper()
-
-              if "APPROVED" in state_upper:
-                  break
-
-              if any(
-                  word in state_upper
-                  for word in (
-                      "REJECTED",
-                      "DENIED",
-                      "FAILED"
-                  )
-              ):
-                  break
-
-              time.sleep(15)
-
-          permission = {
-              "attempted": False,
-              "ok": False
-          }
-
-          if "APPROVED" in moderation_state.upper():
-              permission["attempted"] = True
-
-              payload = {
-                  "subjectType": "Universe",
-                  "subjectId": str(universe),
-                  "action": "Use",
-                  "requests": [
-                      {
-                          "assetId": int(asset_id)
-                      }
-                  ]
-              }
-
-              code, permission_response = request(
-                  "https://apis.roblox.com/asset-permissions-api/v1/assets/permissions",
-                  "PATCH",
-                  payload,
-                  {
-                      "x-api-key": key,
-                      "Content-Type":
-                          "application/json-patch+json"
-                  }
-              )
-
-              success_ids = [
-                  str(x)
-                  for x in (
-                      permission_response.get(
-                          "successAssetIds"
-                      ) or []
-                  )
-              ]
-
-              permission["http"] = code
-              permission["response"] = permission_response
-
-              permission["ok"] = (
-                  str(asset_id) in success_ids
-                  or code in (200, 201, 204)
-              )
-
-          result = {
-              "status": "UPLOAD_COMPLETE",
-              "assetId": str(asset_id),
-              "title": title,
-              "uploaderUserId": owner,
-              "uploadedSpeed": 1.25,
-              "requiredPlaybackSpeed": 0.8,
-              "universeId": str(universe),
-              "moderationState": moderation_state,
-              "permission": permission,
-              "moderationChecks":
-                  moderation_history[-20:]
-          }
-
-          result_path.write_text(
-              json.dumps(
-                  result,
-                  indent=2,
-                  ensure_ascii=False
-              ) + "\n",
-              encoding="utf-8"
-          )
-
-          print(
-              json.dumps(
-                  result,
-                  indent=2,
-                  ensure_ascii=False
-              )
-          )
-          PY
-
-      - name: Show upload result
+          python3 scripts/am-studio-audio-pipeline.py \
+            --batch "$RUNNER_TEMP/talon-audio-batch.json" \
+            --registry config/am-studio-roblox-universes.json \
+            --result upload-result.json
+
+      - name: Preserve receipt
+        if: always() && hashFiles('upload-result.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: talon-am-studio-audio-${{ github.run_id }}
+          path: upload-result.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Show safe result
         if: always()
         shell: bash
         run: |
           if [ -f upload-result.json ]; then
-            cat upload-result.json
-
-            echo "### BBYA Audio Upload" \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo '```json' \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            cat upload-result.json \
-              >> "$GITHUB_STEP_SUMMARY"
-
-            echo '```' \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Reply result to request issue
-        if: always() && github.event_name == 'issues'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          if [ -f upload-result.json ]; then
-            ASSET_ID="$(
-              jq -r '.assetId // "UNKNOWN"' \
-                upload-result.json
-            )"
-
-            STATE="$(
-              jq -r '.moderationState // "UNKNOWN"' \
-                upload-result.json
-            )"
-
-            gh issue comment \
-              "${{ github.event.issue.number }}" \
-              --repo "${{ github.repository }}" \
-              --body "UPLOAD_COMPLETE | Asset ID: ${ASSET_ID} | Moderation: ${STATE} | Roblox PlaybackSpeed: 0.8"
+            jq '{status,uploadedSpeed,playbackSpeed,permissionMode,summary,items:[.items[]|{sourceTitle,assetId,moderation,status,grantedUniverses,failedUniverses}]}' upload-result.json
           else
-            gh issue comment \
-              "${{ github.event.issue.number }}" \
-              --repo "${{ github.repository }}" \
-              --body "UPLOAD_WORKFLOW_FAILED — cek GitHub Actions log."
+            echo 'NO_RECEIPT — NOT READY FOR MAP USE'
           fi
+
+      - name: Reply result to issue
+        if: always() && github.event_name == 'issues'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs=require('fs');
+            const body=fs.existsSync('upload-result.json')
+              ? `AM_STUDIO_AUDIO_RESULT | ${JSON.parse(fs.readFileSync('upload-result.json','utf8')).status} | 1.75x / PlaybackSpeed 0.5714285714 | No map publish attempted.`
+              : 'AM_STUDIO_AUDIO_RESULT | FAILED_BEFORE_RECEIPT | NOT READY FOR MAP USE | No map publish attempted.';
+            await github.rest.issues.createComment({owner:context.repo.owner,repo:context.repo.repo,issue_number:context.issue.number,body});
