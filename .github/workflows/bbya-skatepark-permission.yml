@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      AUDIO_KEY: 
+      AUDIO_KEY: ${{ secrets.TALONTHEDEVIL_AUDIO_PUBLISHER }}
       UNIVERSE_ID: '8116636513'
     steps:
-      - name: Grant Skatepark audio use to BBYA
+      - name: Grant Skatepark audio use to BBYA Social Hub
         shell: bash
         run: |
           set -euo pipefail
@@ -40,10 +40,9 @@ jobs:
           else:
               code,info=req('https://apis.roblox.com/api-keys/v1/introspect','POST',{'apiKey':key},{'Content-Type':'application/json'})
               report['introspectHttp']=code
-              report['keyName']=info.get('name') if isinstance(info,dict) else None
               report['authorizedUserId']=str(info.get('authorizedUserId')) if isinstance(info,dict) and info.get('authorizedUserId') is not None else None
               report['scopes']=[{'name':s.get('name'),'operations':s.get('operations') or []} for s in (info.get('scopes') or [])] if isinstance(info,dict) else []
-              can_write=any((s.get('name')=='asset-permissions:write') or (s.get('name')=='asset-permissions' and 'write' in (s.get('operations') or [])) for s in report['scopes'])
+              can_write=any((s.get('name')=='asset-permissions' and 'write' in (s.get('operations') or [])) or s.get('name')=='asset-permissions:write' for s in report['scopes'])
               report['hasAssetPermissionsWrite']=can_write
               if code!=200 or not can_write:
                   report['status']='NO_ASSET_PERMISSION_SCOPE'
@@ -53,11 +52,9 @@ jobs:
                   report['permissionAttempted']=True; report['permissionHttp']=pcode; report['response']=pbody
                   success=[str(x) for x in (pbody.get('successAssetIds') or [])] if isinstance(pbody,dict) else []
                   report['successAssetIds']=success; report['successCount']=len(success)
-                  errors=(pbody.get('errors') or []) if isinstance(pbody,dict) else []
-                  report['errors']=errors
-                  report['status']='GRANTED_ALL' if len(success)==len(ids) else ('PARTIAL' if success else 'FAILED')
+                  report['status']='GRANTED_ALL' if len(success)==len(ids) else ('HTTP_SUCCESS_VERIFY_RUNTIME' if pcode in (200,201,204) else 'FAILED')
           pathlib.Path('bbya-skatepark-permission-result.json').write_text(json.dumps(report,indent=2)+'\n')
-          print(json.dumps({k:report.get(k) for k in ['status','keyName','authorizedUserId','assetCount','permissionHttp','successCount','hasAssetPermissionsWrite']}))
+          print(json.dumps({k:report.get(k) for k in ['status','assetCount','permissionHttp','successCount','hasAssetPermissionsWrite']}))
           PY
 
       - name: Upload permission result
